@@ -1,11 +1,11 @@
 [package]
 name = "gst-plugin-dashcmafsink"
-description = "DASH - Gstreamer plugin"
+description = "DASH CMAF Sink - Gstreamer plugin"
 authors = ["Roberto Viola"]
-repository = "https://github.com/"
-license = "MIT OR Apache-2.0"
+repository = "https://github.com/tv-vicomtech/gstreamer-dashcmaf"
+license = "MPL-2.0"
 
-version = "0.1.7"
+version = "0.0.1"
 edition = "2021"
 
 [dependencies]
@@ -19,6 +19,7 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 chrono = "0.4"
 sprintf = "0.4"
 serde = "1"
+regex = "1"
 
 once_cell = "1"
 tokio = { version = "1", features = ["full"] }

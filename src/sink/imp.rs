@@ -1,3 +1,11 @@
+// Copyright (C) 2025 Roberto Viola <rviola@vicomtech.org>
+//
+// This Source Code Form is subject to the terms of the Mozilla Public License, v2.0.
+// If a copy of the MPL was not distributed with this file, You can obtain one at
+// <https://mozilla.org/MPL/2.0/>.
+//
+// SPDX-License-Identifier: MPL-2.0
+
 use gst::glib;
 use gst::prelude::*;
 use gst::subclass::prelude::*;
@@ -6,39 +14,39 @@ use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::io::Write;
 use std::fs::File;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::collections::HashMap;
 
-const DEFAULT_TARGET_DURATION: u32 = 2;
+const DEFAULT_TARGET_DURATION: u32 = 10;
 const DEFAULT_LATENCY: gst::ClockTime =
     gst::ClockTime::from_mseconds((DEFAULT_TARGET_DURATION * 500) as u64);
-const DEFAULT_SYNC: bool = false;
+const DEFAULT_SYNC: bool = true;
+const DEFAULT_LOCATION: &str = "manifest.mpd";
 const DEFAULT_INIT_LOCATION: &str = "init.cmfi";
-const DEFAULT_CMAF_LOCATION: &str = "segment_%d.cmfv";
+const DEFAULT_SEGMENT_LOCATION: &str = "segment_%d.cmfv";
 
 struct DashCmafSinkSettings {
-    init_location: String,
     location: String,
+    init_location: String,
+	segment_location: String,
     target_duration: u32,
     sync: bool,
 	latency: gst::ClockTime,
-    playlist_root_init: Option<String>,
+}
 
+struct DashCmafSinkStream {
+    segment_idx: usize,
+	start_time: Option<gst::ClockTime>,
+    end_time: Option<gst::ClockTime>,
+	bandwidth: u64,
     cmafmux: gst::Element,
     appsink: gst_app::AppSink,
 }
 
 #[derive(Default)]
-struct DashCmafSinkState {
-    segment_idx: usize,
-	start_time: Option<gst::ClockTime>,
-    end_time: Option<gst::ClockTime>,
-    path: PathBuf,
-}
-
-#[derive(Default)]
 pub struct DashCmafSink {
     settings: Mutex<DashCmafSinkSettings>,
-	state: Mutex<DashCmafSinkState>,
+	streams: Mutex<HashMap<String, DashCmafSinkStream>>,
 }
 
 #[glib::object_subclass]
@@ -50,31 +58,40 @@ impl ObjectSubclass for DashCmafSink {
 
 impl Default for DashCmafSinkSettings {
     fn default() -> Self {
-        let cmafmux = gst::ElementFactory::make("cmafmux")
-            .name("muxer")
-            .property(
-                "fragment-duration",
-                gst::ClockTime::from_seconds(DEFAULT_TARGET_DURATION as u64),
-            )
-            .property("latency", DEFAULT_LATENCY)
-            .build()
-            .expect("Could not create cmafmux");
-
-        let appsink = gst_app::AppSink::builder()
-            .buffer_list(true)
-            .sync(DEFAULT_SYNC)
-            .name("appsink")
-            .build();
-
         Self {
+			location: String::from(DEFAULT_LOCATION),
             init_location: String::from(DEFAULT_INIT_LOCATION),
-            location: String::from(DEFAULT_CMAF_LOCATION),
+            segment_location: String::from(DEFAULT_SEGMENT_LOCATION),
             target_duration: DEFAULT_TARGET_DURATION,
             sync: DEFAULT_SYNC,
             latency: DEFAULT_LATENCY,
-            playlist_root_init: None,
-            cmafmux,
-            appsink,
+        }
+    }
+}
+
+impl Default for DashCmafSinkStream {
+    fn default() -> Self {
+		let cmafmux = gst::ElementFactory::make("cmafmux")
+			.property(
+				"fragment-duration",
+				gst::ClockTime::from_seconds(DEFAULT_TARGET_DURATION as u64),
+			)
+			.property("latency", DEFAULT_LATENCY)
+			.build()
+			.expect("Could not create cmafmux");
+
+		let appsink = gst_app::AppSink::builder()
+			.buffer_list(true)
+			.sync(DEFAULT_SYNC)
+			.build();
+
+        Self {
+			segment_idx: 0,
+			start_time: Some(gst::ClockTime::from_seconds(0)),
+			end_time: Some(gst::ClockTime::from_seconds(0)),
+			bandwidth: 0,
+			cmafmux,
+			appsink,
         }
     }
 }
@@ -85,15 +102,20 @@ impl ObjectImpl for DashCmafSink {
 	fn properties() -> &'static [glib::ParamSpec] {
         static PROPERTIES: LazyLock<Vec<glib::ParamSpec>> = LazyLock::new(|| {
             vec![
+				glib::ParamSpecString::builder("location")
+                    .nick("MPD Location")
+                    .blurb("Path to write manifest (MPD)")
+                    .default_value(Some(DEFAULT_LOCATION))
+                    .build(),
                 glib::ParamSpecString::builder("init-location")
                     .nick("Init Segment Location")
-                    .blurb("Path to write init.mp4 segment")
+                    .blurb("Path to write init segment")
                     .default_value(Some(DEFAULT_INIT_LOCATION))
                     .build(),
-                glib::ParamSpecString::builder("location")
+				glib::ParamSpecString::builder("segment-location")
                     .nick("Segment Location")
                     .blurb("Template for CMAF segment files")
-                    .default_value(Some(DEFAULT_CMAF_LOCATION))
+                    .default_value(Some(DEFAULT_SEGMENT_LOCATION))
                     .build(),
                 glib::ParamSpecUInt::builder("target-duration")
                     .nick("Target Duration")
@@ -111,10 +133,6 @@ impl ObjectImpl for DashCmafSink {
                     .blurb("Latency in nanoseconds")
                     .default_value(DEFAULT_LATENCY.nseconds())
                     .build(),
-                glib::ParamSpecString::builder("playlist-root-init")
-                    .nick("Playlist Root for Init Segment")
-                    .blurb("Optional base URL for init segment in playlist")
-                    .build(),
             ]
         });
         PROPERTIES.as_ref()
@@ -124,40 +142,33 @@ impl ObjectImpl for DashCmafSink {
 		let mut settings = self.settings.lock().unwrap();
 	
 		match pspec.name() {
+			"location" => {
+				settings.location = value
+					.get::<Option<String>>()
+					.expect("type checked upstream")
+					.unwrap_or_else(|| DEFAULT_LOCATION.into());
+			}
 			"init-location" => {
 				settings.init_location = value
 					.get::<Option<String>>()
 					.expect("type checked upstream")
 					.unwrap_or_else(|| DEFAULT_INIT_LOCATION.into());
 			}
-			"location" => {
-				settings.location = value
+			"segment-location" => {
+				settings.segment_location = value
 					.get::<Option<String>>()
 					.expect("type checked upstream")
-					.unwrap_or_else(|| DEFAULT_CMAF_LOCATION.into());
+					.unwrap_or_else(|| DEFAULT_SEGMENT_LOCATION.into());
 			}
 			"target-duration" => {
 				settings.target_duration = value.get().expect("type checked upstream");
-				settings.cmafmux.set_property(
-					"fragment-duration",
-					gst::ClockTime::from_seconds(settings.target_duration as u64),
-				);
 			}
 			"sync" => {
 				settings.sync = value.get().expect("type checked upstream");
-				settings.appsink.set_property("sync", settings.sync);
 			}
 			"latency" => {
 				let latency_ns = value.get::<u64>().expect("type checked upstream");
 				settings.latency = gst::ClockTime::from_nseconds(latency_ns);
-				settings
-					.cmafmux
-					.set_property("latency", settings.latency);
-			}
-			"playlist-root-init" => {
-				settings.playlist_root_init = value
-					.get::<Option<String>>()
-					.expect("type checked upstream");
 			}
 			_ => unimplemented!(),
 		}
@@ -167,49 +178,18 @@ impl ObjectImpl for DashCmafSink {
 		let settings = self.settings.lock().unwrap();
 	
 		match pspec.name() {
-			"init-location" => settings.init_location.to_value(),
 			"location" => settings.location.to_value(),
+			"init-location" => settings.init_location.to_value(),
+			"segment-location" => settings.segment_location.to_value(),
 			"target-duration" => settings.target_duration.to_value(),
 			"sync" => settings.sync.to_value(),
 			"latency" => settings.latency.nseconds().to_value(),
-			"playlist-root-init" => settings.playlist_root_init.to_value(),
 			_ => unimplemented!("Property {} not implemented", pspec.name()),
 		}
 	}
 
     fn constructed(&self) {
         self.parent_constructed();
-
-        let obj = self.obj();
-        let settings = self.settings.lock().unwrap();
-
-        // Add internal elements to this bin
-		obj.add_many([&settings.cmafmux, settings.appsink.upcast_ref()])
-            .unwrap();
-
-        // Link cmafmux -> appsink
-        settings.cmafmux.link(&settings.appsink).unwrap();
-
-        // Create and add ghost pad pointing to cmafmux's sink pad
-        let sinkpad = settings.cmafmux.static_pad("sink").unwrap();
-        let gpad = gst::GhostPad::with_target(&sinkpad).unwrap();
-        gpad.set_active(true).unwrap();
-        obj.add_pad(&gpad).unwrap();
-
-        // Set up appsink callback
-        let self_weak = self.downgrade();
-        settings.appsink.set_callbacks(
-            gst_app::AppSinkCallbacks::builder()
-                .new_sample(move |sink| {
-                    let Some(imp) = self_weak.upgrade() else {
-                        return Err(gst::FlowError::Eos);
-                    };
-
-                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
-                    imp.on_new_sample(sample)
-                })
-                .build(),
-        );
     }
 }
 
@@ -222,7 +202,7 @@ impl ElementImpl for DashCmafSink {
 				"DASH CMAF Sink",
 				"Sink/Network/Dash",
 				"Handles H264/AAC media buffers",
-				"Name <name@gmail.com>",
+				"Roberto Viola <rviola@vicomtech.org>",
 			)
 		});
 		Some(&*ELEMENT_METADATA)
@@ -231,9 +211,9 @@ impl ElementImpl for DashCmafSink {
     fn pad_templates() -> &'static [gst::PadTemplate] {
         static PAD_TEMPLATES: LazyLock<Vec<gst::PadTemplate>> = LazyLock::new(|| {
             let pad_template = gst::PadTemplate::new(
-                "sink",
+                "sink_%u",
                 gst::PadDirection::Sink,
-                gst::PadPresence::Always,
+                gst::PadPresence::Request,
                 &[
                     gst::Structure::builder("video/x-h264")
                         .field("stream-format", gst::List::new(["avc", "avc3"]))
@@ -258,28 +238,97 @@ impl ElementImpl for DashCmafSink {
 
         PAD_TEMPLATES.as_ref()
     }
+
+	fn request_new_pad(
+		&self,
+		_template: &gst::PadTemplate,
+		_name: Option<&str>,
+		_caps: Option<&gst::Caps>,
+	) -> Option<gst::Pad> {
+		let pad_name = _name.map(|s| s.to_string()).unwrap_or_else(|| {
+			format!("sink_{}", self.streams.lock().unwrap().len())
+		});
+	
+		gst::info!(CAT, imp = self, "Requesting new pad: {pad_name}");
+	
+		// Create stream components
+		let stream = DashCmafSinkStream::default();
+		let settings = self.settings.lock().unwrap();
+		let obj = self.obj();
+
+		stream.cmafmux.set_property(
+			"fragment-duration",
+			gst::ClockTime::from_seconds(settings.target_duration as u64),
+		);
+		stream.cmafmux.set_property("latency", settings.latency);
+		stream.appsink.set_property("sync", settings.sync);
+	
+		// Add and link elements
+		obj.add_many([&stream.cmafmux, stream.appsink.upcast_ref()]).ok()?;
+		stream.cmafmux.link(&stream.appsink).ok()?;
+	
+		// Ghost pad
+		let target_pad = stream.cmafmux.static_pad("sink")?;
+		// let gpad = gst::GhostPad::with_target(&target_pad).ok()?;
+		let gpad = gst::GhostPad::builder(gst::PadDirection::Sink)
+			.name(&pad_name) 
+			.build();
+		gpad.set_target(Some(&target_pad)).expect("Failed to set target pad");
+		gpad.set_active(true).ok()?;
+		obj.add_pad(&gpad).ok()?;
+	
+		// Appsink callback
+		let stream_pad_name = pad_name.clone();
+		let self_weak = self.downgrade();
+		stream.appsink.set_callbacks(
+			gst_app::AppSinkCallbacks::builder()
+				.new_sample(move |sink| {
+					let Some(imp) = self_weak.upgrade() else {
+						return Err(gst::FlowError::Eos);
+					};
+	
+					let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+					imp.on_new_sample(sample, &stream_pad_name) // you could pass pad_name if needed
+				})
+				.build(),
+		);
+	
+		// Store the stream context
+		let mut streams = self.streams.lock().unwrap();
+		streams.insert(pad_name.clone(), stream);
+	
+		Some(gpad.upcast())
+	}
+
+	fn release_pad(&self, _pad: &gst::Pad) {
+		let pad_name = _pad.name();
+		let mut streams = self.streams.lock().unwrap();
+		streams.remove(pad_name.as_str());
+	}
 }
 
 impl BaseSinkImpl for DashCmafSink {}
 
 impl DashCmafSink {
 
-    fn on_init_segment(&self) -> Result<File, std::io::Error> {
+    fn on_init_segment(&self, pad_name: &str) -> Result<File, std::io::Error> {
         let settings = self.settings.lock().unwrap();
-        let path = Path::new(&settings.init_location);
+		let location = format!("{}_{}", pad_name, &settings.init_location);
+        let path = Path::new(&location);
 
         File::create(path)
     }
 
-    fn on_new_fragment(&self) -> Result<(File, String), std::io::Error> {
-        let mut state = self.state.lock().unwrap();
+    fn on_new_segment(&self, pad_name: &str) -> Result<(File, String), std::io::Error> {
+        let mut streams = self.streams.lock().unwrap();
+		let stream = streams.get_mut(pad_name).unwrap(); 
         let settings = self.settings.lock().unwrap();
 
-        // let location = format!( "{}_{}.mp4", &settings.location, state.segment_idx );
-		let location= sprintf::sprintf!(&settings.location, state.segment_idx).unwrap();
-        state.segment_idx += 1;
-		state.start_time = Some(gst::ClockTime::from_mseconds((0) as u64));
-		state.end_time = Some(gst::ClockTime::from_mseconds((2000) as u64 * state.segment_idx as u64));
+		let temp_location= sprintf::sprintf!(&settings.segment_location, stream.segment_idx).unwrap();
+		let location = format!("{}_{}", pad_name, temp_location);
+        stream.segment_idx += 1;
+		stream.start_time = Some(gst::ClockTime::from_seconds((0) as u64));
+		stream.end_time = Some(gst::ClockTime::from_seconds((settings.target_duration) as u64 * stream.segment_idx as u64));
 
         let path = Path::new(&location);
 
@@ -289,83 +338,151 @@ impl DashCmafSink {
 
     fn add_segment(
         &self,
-        // (you could pass duration, time, location, etc. here if needed)
+		_pad_name: &str
     ) -> Result<gst::FlowSuccess, gst::FlowError> {
-		// Now write the manifest
-		let state = self.state.lock().unwrap();
+		let mut streams = self.streams.lock().unwrap();
 		let settings = self.settings.lock().unwrap();
-		let mut path = state.path.clone();
-		path.push("manifest.mpd");
+		let path = settings.location.clone();
 
-		println!("writing manifest to {}", path.display());
+		gst::info!(
+			CAT,
+			imp = self,
+			"writing manifest to {}",
+			path
+		);
 
-		let duration = state
-			.end_time
-			.opt_checked_sub(state.start_time)
-			.ok()
-			.flatten()
-			.unwrap()
-			.mseconds();
+		let mut duration = 0;
 
-		let obj = self.obj();
-		let sink_pad = obj.static_pad("sink").expect("Missing sink pad");
-		let caps = sink_pad.current_caps();
+		let mut video_reps = Vec::new();
+		let mut audio_reps = Vec::new();
+		for (pad_name, stream) in streams.iter_mut() {
 
-		let (media, codec) = if let Some(ref caps) = caps {
-			let s = caps.structure(0).unwrap();
-			let media_type = s.name().as_str();
-		
-			match media_type {
-				"video/x-h264" => ("video".to_string(),"avc1.64001e".to_string()),
-				"audio/mpeg" => ("audio".to_string(),"mp4a.40.2".to_string()),
-				_ => ("unknown".to_string(),"unknown".to_string())
-			}
-		} else {
-			("unknown".to_string(),"unknown".to_string())
-		};
+			duration = stream
+				.end_time
+				.opt_checked_sub(stream.start_time)
+				.ok()
+				.flatten()
+				.unwrap()
+				.mseconds();
 
-		let (width,height, framerate) = if let Some(caps) = caps {
-			let s = caps.structure(0).unwrap();
-			let width = s.get::<i32>("width").ok().unwrap_or(1280);
-			let height = s.get::<i32>("height").ok().unwrap_or(720);
-			let framerate = s.get::<i32>("framerate").ok().unwrap_or(30);
-			(width, height, framerate)
-		} else {
-			(1280, 720, 30)
-		};
+			let obj = self.obj();
+			let sink_pad = obj.static_pad(pad_name).expect("Missing sink pad");
+			let caps = sink_pad.current_caps().unwrap();
+			let s = caps.structure(0);
 
-		let segment_location= settings.location.replace ("%d", "$Number$");
-		let segment_template = dash_mpd::SegmentTemplate {
-			timescale: Some(1000),
-			duration: Some(settings.target_duration as f64 * 1000.0),
-			startNumber: Some(0),
-			initialization: Some(DEFAULT_INIT_LOCATION.to_string()),
-			media: Some(segment_location),
-			..Default::default()
-		};
+			let (media, codec) = if let Some(s) = s {
+				let media_type = s.name();
+			
+				let (media, codec) = match media_type.as_str() {
+					"video/x-h264" => ("video".to_string(), "avc1.64001e".to_string()),
+					"audio/mpeg" => ("audio".to_string(), "mp4a.40.2".to_string()),
+					_ => ("unknown".to_string(), "unknown".to_string()),
+				};
+			
+				(media, codec)
+			} else {
+				("unknown".to_string(), "unknown".to_string())
+			};
 
-		let rep = dash_mpd::Representation {
-			id: Some("A".to_string()),
-			width: Some(width as u64),
-			height: Some(height as u64),
-			bandwidth: Some(2048000),
-			SegmentTemplate: Some(segment_template),
-			..Default::default()
-		};
+			match media.as_str() {
+				"video" => {
+					let (width, height, framerate) = if let Some(s) = s {
+						let width = s.get::<i32>("width").unwrap_or(1280);
+						let height = s.get::<i32>("height").unwrap_or(720);
+						let fps = s.get::<gst::Fraction>("framerate").unwrap_or(gst::Fraction::new(30, 1));
+						let framerate = format!("{}/{}", fps.numer(), fps.denom());
+					
+						(width, height, framerate)
+					} else {
+						(1280, 720, "30/1".to_string())
+					};
 
-		let adapt = dash_mpd::AdaptationSet {
-			contentType: Some(media.clone()),
-			mimeType: Some(media + "/mp4"),
-			codecs: Some(codec),
-			frameRate: Some(framerate.to_string() + "/1"),
-			segmentAlignment: Some(true),
-			subsegmentStartsWithSAP: Some(1),
-			representations: vec![rep],
-			..Default::default()
-		};
+					gst::info!(
+						CAT,
+						imp = self,
+						"MPD info: media={} codec={} width={} height={} framerate={}",
+						media, codec, width, height, framerate
+					);
+
+					let segment_location= settings.segment_location.replace ("%d", "$Number$");
+					let segment_template = dash_mpd::SegmentTemplate {
+						timescale: Some(1000),
+						duration: Some(settings.target_duration as f64 * 1000.0),
+						startNumber: Some(0),
+						initialization: Some(format!("{}_{}", pad_name, &settings.init_location)),
+						media: Some(format!("{}_{}", pad_name, &segment_location)),
+						..Default::default()
+					};
+
+					let rep = dash_mpd::Representation {
+						id: Some(pad_name.to_string()),
+						codecs: Some(codec),
+						width: Some(width as u64),
+						height: Some(height as u64),
+						frameRate: Some(framerate),
+						bandwidth: Some(stream.bandwidth as u64),
+						SegmentTemplate: Some(segment_template),
+						..Default::default()
+					};
+					video_reps.push(rep)
+				},
+				"audio" => {
+					gst::info!(
+						CAT,
+						imp = self,
+						"MPD info: media={} codec={}",
+						media, codec
+					);
+
+					let segment_location= settings.segment_location.replace ("%d", "$Number$");
+					let segment_template = dash_mpd::SegmentTemplate {
+						timescale: Some(1000),
+						duration: Some(settings.target_duration as f64 * 1000.0),
+						startNumber: Some(0),
+						initialization: Some(format!("{}_{}", pad_name, &settings.init_location)),
+						media: Some(format!("{}_{}", pad_name, &segment_location)),
+						..Default::default()
+					};
+
+					let rep = dash_mpd::Representation {
+						id: Some(pad_name.to_string()),
+						codecs: Some(codec),
+						bandwidth: Some(stream.bandwidth as u64),
+						SegmentTemplate: Some(segment_template),
+						..Default::default()
+					};
+					audio_reps.push(rep)
+				},
+				_ => {}
+			};
+		}
+
+		let mut adaptations = Vec::new();
+
+		if !video_reps.is_empty() {
+			adaptations.push(dash_mpd::AdaptationSet {
+				contentType: Some("video".into()),
+				mimeType: Some("video/mp4".into()),
+				segmentAlignment: Some(true),
+				subsegmentStartsWithSAP: Some(1),
+				representations: video_reps,
+				..Default::default()
+			});
+		}
+
+		if !audio_reps.is_empty() {
+			adaptations.push(dash_mpd::AdaptationSet {
+				contentType: Some("audio".into()),
+				mimeType: Some("audio/mp4".into()),
+				segmentAlignment: Some(true),
+				subsegmentStartsWithSAP: Some(1),
+				representations: audio_reps,
+				..Default::default()
+			});
+		}
 
 		let period = dash_mpd::Period {
-			adaptations: vec![adapt],
+			adaptations: adaptations,
 			..Default::default()
 		};
 
@@ -376,7 +493,7 @@ impl DashCmafSink {
 			profiles: Some("urn:mpeg:dash:profile:isoff-on-demand:2011".to_string()),
 			periods: vec![period],
 			mediaPresentationDuration: Some(std::time::Duration::from_millis(duration)),
-			minBufferTime: Some(std::time::Duration::from_secs(1)),
+			minBufferTime: Some(std::time::Duration::from_secs(settings.target_duration as u64)),
 			..Default::default()
 		};
 
@@ -397,7 +514,7 @@ impl DashCmafSink {
         Ok(gst::FlowSuccess::Ok)
     }
 
-    fn on_new_sample(&self, sample: gst::Sample) -> Result<gst::FlowSuccess, gst::FlowError> {
+    fn on_new_sample(&self, sample: gst::Sample, pad_name: &str) -> Result<gst::FlowSuccess, gst::FlowError> {
 		let mut buffer_list = sample.buffer_list_owned().ok_or(gst::FlowError::Error)?;
 		let first = buffer_list.get(0).ok_or(gst::FlowError::Error)?;
 	
@@ -406,7 +523,7 @@ impl DashCmafSink {
 			.flags()
 			.contains(gst::BufferFlags::DISCONT | gst::BufferFlags::HEADER)
 		{
-			let mut stream = self.on_init_segment().map_err(|err| {
+			let mut stream = self.on_init_segment(pad_name).map_err(|err| {
 				gst::error!(
 					CAT,
 					imp = self,
@@ -441,7 +558,7 @@ impl DashCmafSink {
 		}
 	
 		// Get output stream + location
-		let (mut stream, _location) = self.on_new_fragment().map_err(|err| {
+		let (mut stream, _location) = self.on_new_segment(pad_name).map_err(|err| {
 			gst::error!(
 				CAT,
 				imp = self,
@@ -450,6 +567,7 @@ impl DashCmafSink {
 			gst::FlowError::Error
 		})?;
 	
+		let mut total_size = 0;
 		// Write all fragment buffers
 		for buffer in &*buffer_list {
 			let map = buffer.map_readable().map_err(|_| {
@@ -461,15 +579,23 @@ impl DashCmafSink {
 				gst::error!(CAT, imp = self, "Couldn't write fragment to output stream");
 				gst::FlowError::Error
 			})?;
+			total_size += map.size();
 		}
+		{
+			let mut streams = self.streams.lock().unwrap();
+			let dash_stream = streams.get_mut(pad_name).unwrap(); 
+			let settings = self.settings.lock().unwrap();
+			dash_stream.bandwidth = total_size as u64 * 8 / settings.target_duration as u64;
+			gst::info!(CAT, imp = self, "total size: {} bandwidth: {}", total_size, dash_stream.bandwidth);
+		};
+		
 	
 		stream.flush().map_err(|_| {
 			gst::error!(CAT, imp = self, "Couldn't flush fragment stream");
 			gst::FlowError::Error
 		})?;
 	
-		// Notify the playlist index (or whatever your segment tracker is)
-		self.add_segment()
+		self.add_segment(pad_name)
 	}	
 }
 
