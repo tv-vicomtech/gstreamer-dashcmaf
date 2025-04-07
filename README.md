@@ -1,9 +1,10 @@
+<div align="center">
+<img style="border-radius: 5px;" width="430" src="https://www.vicomtech.org/dist/img/logo.svg"> <br>
+</div>
+
 # GStreamer plugin for DASH CMAF Sink
 
 This work is supported by 6G-XR project (https://6g-xr.eu/).
-
-<div align="center">
-<img style="border-radius: 5px;" width="430" src="https://www.vicomtech.org/dist/img/logo.svg"> <br>
 
 # :busts_in_silhouette: Leading company and participants
 
@@ -21,7 +22,7 @@ The DASH CMAF Sink provides an alternative to the DASH implementation already av
 Technology stack used in the project.
 - [x] GStreamer RUST
 
-# ‎‍:thumbsup: Contributions
+# :thumbsup: Contributions
 People involved in the project:
 
 - 👨‍💻 Roberto Viola (<rviola@vicomtech.org>)
