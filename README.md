@@ -1,6 +1,4 @@
-```
 **WARNING:** This is an old version of the plugin. The latest implementation is available in a [Merge Request to gst-plugins-rs](https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs/-/merge_requests/2186).
-```
 
 <div align="center">
 <img style="border-radius: 5px;" width="430" src="https://www.vicomtech.org/dist/img/logo.svg"> <br>
